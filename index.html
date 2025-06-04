@@ -2672,80 +2672,63 @@ gtag('config', 'G-QCJKG8NXX0');
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <style>
-    * {
-      cursor: none;
-    }
-
+    * { cursor: none; }
+    
     .cursor {
       position: fixed;
       width: 20px;
       height: 20px;
-      border: 2px solid white;
+      border: 2px solid var(--cursor-color, #000000);
       border-radius: 50%;
-      background: rgba(255, 255, 255, 0.1);
+      background: transparent;
       transform: translate(-50%, -50%);
       pointer-events: none;
-      z-index: 10000;
-      box-shadow: 0 0 15px rgba(255, 255, 255, 0.5);
-      transition: transform 0.1s;
-      display: none;
+      z-index: 2147483647; /* Maximum possible z-index */
+      opacity: 0;
+      transition: opacity 0.2s, border-color 0.3s;
+      box-shadow: 0 0 0 1px var(--cursor-outline, rgba(255,255,255,0.5));
     }
-
-    .cursor-trail {
+    
+    .cursor.visible {
+      opacity: 1;
+    }
+    
+    .trail {
       position: fixed;
       width: 6px;
       height: 6px;
       border-radius: 50%;
-      background: rgba(255, 255, 255, 0.7);
+      background: var(--cursor-color, #000000);
       transform: translate(-50%, -50%);
       pointer-events: none;
-      z-index: 9999;
-      opacity: 0.6;
+      z-index: 2147483646;
+      opacity: 0;
+      transition: opacity 0.1s, background 0.3s;
     }
-
+    
+    .trail.visible {
+      opacity: 0.7;
+    }
+    
     .ripple {
       position: fixed;
-      border: 2px solid rgba(255, 255, 255, 0.8);
+      border: 2px solid var(--cursor-color, #000000);
       border-radius: 50%;
       transform: translate(-50%, -50%);
-      animation: rippleEffect 0.6s ease-out;
       pointer-events: none;
+      z-index: 2147483645;
+      animation: ripple 0.6s ease-out forwards;
+      box-shadow: 0 0 0 1px var(--cursor-outline, rgba(255,255,255,0.5));
     }
-
-    .particle {
-      position: fixed;
-      width: 3px;
-      height: 3px;
-      background: white;
-      border-radius: 50%;
-      pointer-events: none;
-      animation: particleFade 1s ease-out;
-    }
-
-    @keyframes rippleEffect {
-      0% {
-        width: 0;
-        height: 0;
-        opacity: 1;
-      }
-      100% {
-        width: 150px;
-        height: 150px;
-        opacity: 0;
-      }
-    }
-
-    @keyframes particleFade {
-      0% {
-        transform: translate(0, 0);
-        opacity: 1;
-      }
-      100% {
-        transform: translate(var(--tx), var(--ty));
-        opacity: 0;
+    
+    @keyframes ripple {
+      to { 
+        width: 150px; 
+        height: 150px; 
+        opacity: 0; 
       }
     }
   </style>
@@ -2753,77 +2736,153 @@ gtag('config', 'G-QCJKG8NXX0');
 <body>
   <div class="cursor" id="cursor"></div>
 
+  <!-- Include tinycolor.js for advanced color analysis -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/tinycolor/1.4.2/tinycolor.min.js"></script>
+  
   <script>
-    const cursor = document.getElementById("cursor");
-    let trails = [];
-
-    // Only activate cursor if mouse is detected
-    let mouseDetected = false;
-    const isTouchDevice = () => {
-      return (('ontouchstart' in window) || navigator.maxTouchPoints > 0);
-    };
-
-    if (!isTouchDevice()) {
-      document.addEventListener("mousemove", (e) => {
-        if (!mouseDetected) {
-          mouseDetected = true;
-          cursor.style.display = "block";
-
-          for (let i = 0; i < 12; i++) {
-            let trail = document.createElement("div");
-            trail.className = "cursor-trail";
-            trail.style.opacity = 1 - i / 12;
-            document.body.appendChild(trail);
-            trails.push(trail);
-          }
-        }
-
-        // Main cursor
-        cursor.style.left = e.clientX + "px";
-        cursor.style.top = e.clientY + "px";
-
-        // Trails
-        trails.forEach((trail, i) => {
-          setTimeout(() => {
-            trail.style.left = e.clientX + "px";
-            trail.style.top = e.clientY + "px";
-          }, i * 20);
-        });
-
-        createParticles(e.clientX, e.clientY);
+    (function() {
+      // Memory-efficient implementation
+      const cursor = document.getElementById('cursor');
+      const trails = Array(8).fill(0).map(() => {
+        const t = document.createElement('div');
+        t.className = 'trail';
+        document.body.appendChild(t);
+        return t;
       });
-
-      document.addEventListener("click", (e) => {
-        const ripple = document.createElement("div");
-        ripple.className = "ripple";
-        ripple.style.left = e.clientX + "px";
-        ripple.style.top = e.clientY + "px";
+      
+      let lastX = 0, lastY = 0;
+      let trailPos = 0;
+      let isCursorInViewport = false;
+      
+      // Advanced background color detection with tinycolor
+      function getContrastColor(x, y) {
+        // Create a temporary element to sample colors
+        const sampler = document.createElement('div');
+        sampler.style.position = 'fixed';
+        sampler.style.width = '1px';
+        sampler.style.height = '1px';
+        sampler.style.left = x + 'px';
+        sampler.style.top = y + 'px';
+        sampler.style.pointerEvents = 'none';
+        sampler.style.opacity = '0';
+        document.body.appendChild(sampler);
+        
+        // Get computed style at this position
+        const bgColor = window.getComputedStyle(sampler).backgroundColor;
+        document.body.removeChild(sampler);
+        
+        // Analyze color with tinycolor
+        const color = tinycolor(bgColor);
+        if (!color.isValid()) return { color: '#000000', outline: 'rgba(255,255,255,0.5)' };
+        
+        // Check if color is very light or very dark
+        const isLight = color.getBrightness() > 180;
+        const isDark = color.getBrightness() < 75;
+        
+        if (isLight) {
+          return { color: '#000000', outline: 'rgba(255,255,255,0.5)' };
+        } else if (isDark) {
+          return { color: '#ffffff', outline: 'rgba(0,0,0,0.5)' };
+        }
+        
+        // For mid-tone colors, use high contrast
+        return color.isLight() ? 
+          { color: '#000000', outline: 'rgba(255,255,255,0.8)' } : 
+          { color: '#ffffff', outline: 'rgba(0,0,0,0.8)' };
+      }
+      
+      // Check if cursor is in viewport
+      function checkCursorInViewport(x, y) {
+        const wasInViewport = isCursorInViewport;
+        isCursorInViewport = (
+          x >= 0 && 
+          x <= window.innerWidth && 
+          y >= 0 && 
+          y <= window.innerHeight
+        );
+        
+        if (isCursorInViewport !== wasInViewport) {
+          cursor.classList.toggle('visible', isCursorInViewport);
+        }
+      }
+      
+      // Efficient animation loop
+      function updateCursor(x, y) {
+        checkCursorInViewport(x, y);
+        
+        if (!isCursorInViewport) return;
+        
+        // Update cursor color based on current background
+        const { color, outline } = getContrastColor(x, y);
+        document.documentElement.style.setProperty('--cursor-color', color);
+        document.documentElement.style.setProperty('--cursor-outline', outline);
+        
+        cursor.style.left = x + 'px';
+        cursor.style.top = y + 'px';
+        
+        // Update trails in a circular buffer pattern
+        const t = trails[trailPos];
+        t.style.left = x + 'px';
+        t.style.top = y + 'px';
+        t.classList.add('visible');
+        setTimeout(() => t.classList.remove('visible'), 100);
+        trailPos = (trailPos + 1) % trails.length;
+        
+        lastX = x;
+        lastY = y;
+      }
+      
+      // Throttled mousemove handler
+      let lastUpdate = 0;
+      function handleMouseMove(e) {
+        const now = performance.now();
+        if (now - lastUpdate >= 16) { // ~60fps
+          requestAnimationFrame(() => updateCursor(e.clientX, e.clientY));
+          lastUpdate = now;
+        }
+      }
+      
+      // Mouse handling
+      document.addEventListener('mousemove', handleMouseMove);
+      
+      document.addEventListener('mouseleave', () => {
+        cursor.classList.remove('visible');
+      });
+      
+      document.addEventListener('mouseenter', () => {
+        if (isCursorInViewport) {
+          cursor.classList.add('visible');
+        }
+      });
+      
+      document.addEventListener('click', (e) => {
+        if (!isCursorInViewport) return;
+        
+        const ripple = document.createElement('div');
+        ripple.className = 'ripple';
+        ripple.style.left = e.clientX + 'px';
+        ripple.style.top = e.clientY + 'px';
+        ripple.style.width = '0';
+        ripple.style.height = '0';
         document.body.appendChild(ripple);
         setTimeout(() => ripple.remove(), 600);
-
-        cursor.style.transform = "translate(-50%, -50%) scale(0.7)";
+        
+        cursor.style.transform = 'translate(-50%, -50%) scale(0.7)';
         setTimeout(() => {
-          cursor.style.transform = "translate(-50%, -50%) scale(1)";
+          cursor.style.transform = 'translate(-50%, -50%) scale(1)';
         }, 100);
       });
-    }
-
-    function createParticles(x, y) {
-      for (let i = 0; i < 2; i++) {
-        const particle = document.createElement("div");
-        particle.className = "particle";
-        const angle = Math.random() * Math.PI * 2;
-        const distance = 5 + Math.random() * 20;
-        const tx = Math.cos(angle) * distance;
-        const ty = Math.sin(angle) * distance;
-        particle.style.setProperty("--tx", `${tx}px`);
-        particle.style.setProperty("--ty", `${ty}px`);
-        particle.style.left = x + "px";
-        particle.style.top = y + "px";
-        document.body.appendChild(particle);
-        setTimeout(() => particle.remove(), 1000);
+      
+      // Touch device detection
+      if ('ontouchstart' in window || navigator.maxTouchPoints > 0) {
+        cursor.style.display = 'none';
+        trails.forEach(t => t.style.display = 'none');
       }
-    }
+      
+      // Initial cursor position
+      cursor.style.left = '0px';
+      cursor.style.top = '0px';
+    })();
   </script>
 </body>
 </html>
