@@ -1,4 +1,4 @@
->
+
 (function(){
   const RESOURCE_INDEX_KEY = 'autosnap:resources';
   const PREFIX = 'autosnap:res:';
