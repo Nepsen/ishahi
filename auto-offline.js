@@ -1,4 +1,4 @@
-<script>
+
 (function() {
   // Configuration
   const CACHE_VERSION = 'v1';
@@ -204,4 +204,3 @@
     init();
   }
 })();
-</script>
