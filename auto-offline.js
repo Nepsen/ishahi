@@ -1,85 +1,79 @@
 (function(){
-  const RESOURCE_INDEX_KEY = 'autosnap:resources';
-  const PREFIX = 'autosnap:res:';
-  const REFRESH_INTERVAL = 60000; // 1 মিনিট
+  const CACHE_NAME = 'auto-snap-cache-v1';
+  const REFRESH_INTERVAL = 60000; // প্রতি মিনিটে আপডেট
 
-  function isFetchable(url) {
-    try {
-      const u = new URL(url, location.href);
-      return (u.protocol === 'http:' || u.protocol === 'https:') && u.origin === location.origin;
-    } catch { return false; }
-  }
-
-  function collectResourceUrls() {
-    const urls = new Set();
+  // রিসোর্স কালেক্ট
+  function collectResources() {
+    const urls = new Set([location.href.split(/[?#]/)[0]]);
     document.querySelectorAll(`
-      link[href], script[src], img[src], source[src], video[src], audio[src],
-      iframe[src], embed[src], object[data], link[rel*="icon"][href], link[rel="manifest"][href]
+      link[href], script[src], img[src], source[src],
+      video[src], audio[src], iframe[src], embed[src],
+      object[data], link[rel*="icon"][href], link[rel="manifest"][href]
     `).forEach(el => {
       const url = el.href || el.src || el.data;
-      if (url) try { urls.add(new URL(url, location.href).href.split(/[?#]/)[0]); } catch{}
-    });
-    return Array.from(urls).filter(isFetchable);
-  }
-
-  async function fetchAsDataURL(url) {
-    try {
-      console.log(`[AutoSnap] Downloading: ${url}`);
-      const res = await fetch(url, {cache: 'no-store', mode: 'same-origin'});
-      if (!res.ok) return null;
-      const blob = await res.blob();
-      return await new Promise(resolve => {
-        const reader = new FileReader();
-        reader.onloadend = () => resolve(reader.result);
-        reader.readAsDataURL(blob);
-      });
-    } catch (e) {
-      console.warn(`[AutoSnap] Error downloading ${url}`, e);
-      return null;
-    }
-  }
-
-  async function saveAllResources() {
-    console.log('[AutoSnap] Scanning resources...');
-    const resourceUrls = collectResourceUrls();
-    localStorage.setItem(RESOURCE_INDEX_KEY, JSON.stringify(resourceUrls));
-
-    for (const url of resourceUrls) {
-      const key = PREFIX + url;
-      const dataUrl = await fetchAsDataURL(url);
-      if (dataUrl) {
-        localStorage.setItem(key, dataUrl);
-        console.log(`[AutoSnap] Saved: ${url}`);
+      if (url) {
+        try { urls.add(new URL(url, location.href).href.split(/[?#]/)[0]); } catch{}
       }
-    }
-    console.log('[AutoSnap] Snapshot saved!');
+    });
+    return Array.from(urls);
   }
 
-  function loadFromLocal() {
-    console.log('[AutoSnap] Offline mode: Loading cached resources...');
-    const resourceUrls = JSON.parse(localStorage.getItem(RESOURCE_INDEX_KEY) || '[]');
+  // সার্ভিস ওয়ার্কার রেজিস্টার
+  function registerServiceWorker(resources) {
+    if (!('serviceWorker' in navigator)) {
+      console.warn('[AutoSnap] Service Worker সমর্থিত নয়');
+      return;
+    }
 
-    resourceUrls.forEach(url => {
-      const dataUrl = localStorage.getItem(PREFIX + url);
-      if (!dataUrl) return;
+    const swCode = `
+      const CACHE_NAME = '${CACHE_NAME}';
+      const RESOURCES = ${JSON.stringify(resources)};
 
-      document.querySelectorAll(`[src="${url}"], [href="${url}"]`).forEach(el => {
-        if (el.src) el.src = dataUrl;
-        if (el.href) el.href = dataUrl;
+      self.addEventListener('install', e => {
+        e.waitUntil(
+          caches.open(CACHE_NAME)
+            .then(cache => cache.addAll(RESOURCES))
+            .then(() => self.skipWaiting())
+        );
       });
-      console.log(`[AutoSnap] Loaded cached: ${url}`);
-    });
+
+      self.addEventListener('activate', e => {
+        e.waitUntil(
+          caches.keys().then(keys =>
+            Promise.all(keys.map(key => key !== CACHE_NAME && caches.delete(key)))
+          ).then(() => self.clients.claim())
+        );
+      });
+
+      self.addEventListener('fetch', e => {
+        e.respondWith(
+          caches.match(e.request).then(res => res || fetch(e.request).then(networkRes => {
+            // অনলাইনে থাকলে নতুন রিসোর্স আপডেট
+            caches.open(CACHE_NAME).then(cache => cache.put(e.request, networkRes.clone()));
+            return networkRes;
+          }).catch(() => res))
+        );
+      });
+    `;
+
+    const blob = new Blob([swCode], {type: 'application/javascript'});
+    navigator.serviceWorker.register(URL.createObjectURL(blob))
+      .then(() => console.log('[AutoSnap] Service Worker রেজিস্টার হয়েছে'))
+      .catch(err => console.error('[AutoSnap] SW রেজিস্টার ব্যর্থ:', err));
   }
 
   function init() {
-    if (navigator.onLine) {
-      saveAllResources();
-      setInterval(() => {
-        if (navigator.onLine) saveAllResources();
-      }, REFRESH_INTERVAL);
-    } else {
-      loadFromLocal(); // শুধু রিসোর্স লোড, পেজ রিলোড না
-    }
+    const resources = collectResources();
+    console.log('[AutoSnap] Resources:', resources);
+    registerServiceWorker(resources);
+
+    // প্রতি মিনিটে আপডেট
+    setInterval(() => {
+      if (navigator.onLine) {
+        const updatedResources = collectResources();
+        registerServiceWorker(updatedResources);
+      }
+    }, REFRESH_INTERVAL);
   }
 
   if (document.readyState === 'loading') {
