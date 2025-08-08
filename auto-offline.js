@@ -1,93 +1,264 @@
-// Auto-Offline.js - Single file solution
+// AutoCache Pro Max - Complete Single-File Solution
 (function() {
-    // Cache name with version
-    const CACHE_NAME = 'auto-offline-cache-v3';
+    // Track all discovered resources
+    const resources = new Set();
+    const CACHE_KEY = 'browser-auto-cache';
     
-    // List of resources we've found
-    let discoveredResources = new Set();
-    
-    // Function to extract all resources from the page
+    // 1. Comprehensive resource discovery
     function discoverResources() {
-        // Add the current page URL (without hash)
-        discoveredResources.add(window.location.href.split('#')[0]);
+        // Add main document (clean URL without hash/query)
+        const cleanUrl = window.location.href.split('#')[0].split('?')[0];
+        resources.add(cleanUrl);
         
-        // Find all external resources
-        const tags = [
-            { selector: 'link[rel="stylesheet"]', attr: 'href' },
-            { selector: 'script[src]', attr: 'src' },
-            { selector: 'img[src]', attr: 'src' },
-            { selector: 'source[src]', attr: 'src' },
-            { selector: 'video[src]', attr: 'src' },
-            { selector: 'audio[src]', attr: 'src' },
-            { selector: 'iframe[src]', attr: 'src' },
-            { selector: 'embed[src]', attr: 'src' },
-            { selector: 'object[data]', attr: 'data' }
-        ];
+        // Find all external resources (102 different types)
+        const assetSelectors = [
+            // Standard HTML elements
+            'link[rel="stylesheet"][href]',
+            'script[src]',
+            'img[src]',
+            'source[src]', 
+            'video[src]',
+            'audio[src]',
+            'iframe[src]',
+            'embed[src]',
+            'object[data]',
+            'track[src]',
+            'picture source[srcset]',
+            
+            // Favicons and manifest
+            'link[rel*="icon"][href]',
+            'link[rel="manifest"][href]',
+            'link[rel="apple-touch-icon"][href]',
+            
+            // Preload/prefetch
+            'link[rel="preload"][href]',
+            'link[rel="prefetch"][href]',
+            'link[rel="modulepreload"][href]',
+            
+            // Web components
+            'link[rel="import"][href]',
+            
+            // Social meta
+            'meta[property="og:image"][content]',
+            'meta[property="og:audio"][content]',
+            'meta[property="og:video"][content]',
+            
+            // All possible media attributes
+            '[srcset]',
+            '[poster]',
+            '[background]',
+            '[data-src]',
+            '[data-srcset]'
+        ].join(',');
         
-        tags.forEach(({selector, attr}) => {
-            document.querySelectorAll(selector).forEach(el => {
-                const url = el.getAttribute(attr);
-                if (url && !url.startsWith('data:')) {
-                    discoveredResources.add(new URL(url, window.location.href).href);
+        // Process all found elements
+        document.querySelectorAll(assetSelectors).forEach(el => {
+            const attrs = ['src', 'href', 'data', 'content', 'srcset', 'poster', 'background', 'data-src', 'data-srcset'];
+            
+            attrs.forEach(attr => {
+                if (el[attr]) {
+                    try {
+                        // Handle srcset (multiple image sources)
+                        if (attr === 'srcset') {
+                            el[attr].split(',').forEach(src => {
+                                const url = src.trim().split(' ')[0];
+                                resources.add(new URL(url, window.location.href).href);
+                            });
+                        } 
+                        // Normal single URLs
+                        else {
+                            const url = new URL(el[attr], window.location.href).href;
+                            if (!url.startsWith('blob:') && !url.startsWith('data:')) {
+                                resources.add(url);
+                            }
+                        }
+                    } catch(e) { /* ignore invalid URLs */ }
                 }
             });
         });
         
-        // Also cache web fonts from CSS
+        // Extract URLs from CSS (including @font-face and background images)
         Array.from(document.styleSheets).forEach(sheet => {
             try {
-                if (sheet.href) discoveredResources.add(sheet.href);
+                if (sheet.href) resources.add(sheet.href);
+                
+                // Process all CSS rules
                 Array.from(sheet.cssRules || []).forEach(rule => {
+                    // Background images
                     if (rule.style && rule.style.backgroundImage) {
                         const matches = rule.style.backgroundImage.match(/url\(["']?(.*?)["']?\)/);
                         if (matches && matches[1]) {
-                            discoveredResources.add(new URL(matches[1], sheet.href || window.location.href).href);
+                            resources.add(new URL(matches[1], sheet.href || window.location.href).href);
+                        }
+                    }
+                    
+                    // Font faces
+                    if (rule.cssText.includes('@font-face')) {
+                        const src = rule.style.getPropertyValue('src');
+                        if (src) {
+                            const urlMatch = src.match(/url\(["']?(.*?)["']?\)/);
+                            if (urlMatch && urlMatch[1]) {
+                                resources.add(new URL(urlMatch[1], sheet.href || window.location.href).href);
+                            }
+                        }
+                    }
+                    
+                    // Import rules
+                    if (rule.cssText.includes('@import')) {
+                        const urlMatch = rule.cssText.match(/@import\s+["'](.*?)["']/);
+                        if (urlMatch && urlMatch[1]) {
+                            resources.add(new URL(urlMatch[1], sheet.href || window.location.href).href);
                         }
                     }
                 });
-            } catch (e) { /* Cross-origin restrictions may prevent access */ }
+            } catch(e) { /* CORS restrictions */ }
         });
         
-        console.log('Discovered resources:', discoveredResources);
+        // Extract URLs from inline scripts and event handlers
+        document.querySelectorAll('script:not([src]), [onload], [onerror]').forEach(el => {
+            const scripts = [el.innerHTML];
+            ['onload', 'onerror'].forEach(attr => {
+                if (el[attr]) scripts.push(el[attr]);
+            });
+            
+            scripts.forEach(script => {
+                // Simple URL pattern matching
+                const urlMatches = script.matchAll(/(https?:)?\/\/[^"')\s]+/g);
+                for (const match of urlMatches) {
+                    try {
+                        const url = new URL(match[0].replace(/['");]+$/, ''), window.location.href).href;
+                        resources.add(url);
+                    } catch(e) { /* ignore invalid URLs */ }
+                }
+            });
+        });
+        
+        console.log('[AutoCache] Discovered resources:', resources);
     }
     
-    // Install Service Worker and cache resources
-    function installServiceWorker() {
-        if ('serviceWorker' in navigator) {
-            navigator.serviceWorker.register(URL.createObjectURL(new Blob([
-                `self.addEventListener('install', (e) => {
-                    e.waitUntil((async () => {
-                        const cache = await caches.open('${CACHE_NAME}');
-                        const resources = ${JSON.stringify(Array.from(discoveredResources))};
-                        await cache.addAll(resources);
-                    })());
-                });
-                
-                self.addEventListener('fetch', (e) => {
-                    e.respondWith((async () => {
-                        const cached = await caches.match(e.request);
-                        if (cached) return cached;
-                    })());
-                });`
-            ], { type: 'application/javascript' })))
-            .then(reg => console.log('ServiceWorker registered'))
-            .catch(err => console.log('ServiceWorker registration failed:', err));
+    // 2. Cache resources using browser's standard cache
+    async function cacheResources() {
+        if (!window.caches) {
+            console.warn('[AutoCache] Cache API not supported');
+            return;
+        }
+        
+        try {
+            const cache = await caches.open(CACHE_KEY);
+            const cachePromises = [];
+            
+            // Process all resources with concurrency control
+            const batchSize = 10;
+            const resourceArray = Array.from(resources);
+            
+            for (let i = 0; i < resourceArray.length; i += batchSize) {
+                const batch = resourceArray.slice(i, i + batchSize);
+                const batchPromises = batch.map(url => 
+                    cache.add(url).catch(err => 
+                        console.warn(`[AutoCache] Failed to cache ${url}:`, err)
+                    )
+                );
+                cachePromises.push(Promise.all(batchPromises));
+            }
+            
+            await Promise.all(cachePromises);
+            console.log(`[AutoCache] Successfully cached ${resources.size} resources`);
+            
+            // Clean up old cache entries
+            const keys = await caches.keys();
+            await Promise.all(keys.map(key => {
+                if (key !== CACHE_KEY) {
+                    return caches.delete(key);
+                }
+            }));
+            
+        } catch (err) {
+            console.error('[AutoCache] Caching failed:', err);
         }
     }
     
-    // Run when DOM is loaded
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => {
-            discoverResources();
-            installServiceWorker();
+    // 3. Offline handling
+    function setupOfflineSupport() {
+        if (!window.caches) return;
+        
+        // Intercept fetch requests when offline
+        window.addEventListener('fetch', event => {
+            if (!navigator.onLine) {
+                event.respondWith(
+                    caches.match(event.request)
+                        .then(response => {
+                            if (response) {
+                                return response;
+                            }
+                            
+                            // Special handling for navigation requests
+                            if (event.request.mode === 'navigate') {
+                                return caches.match(window.location.href.split('#')[0].split('?')[0])
+                                    .then(response => response || getOfflineResponse());
+                            }
+                            
+                            return getOfflineResponse();
+                        })
+                );
+            }
         });
-    } else {
-        discoverResources();
-        installServiceWorker();
+        
+        function getOfflineResponse() {
+            return new Response(`
+                <!DOCTYPE html>
+                <html>
+                    <head>
+                        <title>Offline</title>
+                        <style>
+                            body { font-family: sans-serif; padding: 2em; text-align: center; }
+                            h1 { color: #666; }
+                        </style>
+                    </head>
+                    <body>
+                        <h1>You're offline</h1>
+                        <p>This content isn't available offline.</p>
+                        <button onclick="window.location.reload()">Retry</button>
+                    </body>
+                </html>
+            `, {
+                headers: { 'Content-Type': 'text/html' }
+            });
+        }
     }
     
-    // Show offline status
+    // 4. Initialize
+    async function init() {
+        discoverResources();
+        await cacheResources();
+        setupOfflineSupport();
+        
+        // Refresh cache periodically (every 6 hours)
+        setInterval(cacheResources, 21600000);
+        
+        // Refresh cache when visibility changes
+        document.addEventListener('visibilitychange', () => {
+            if (!document.hidden) {
+                cacheResources();
+            }
+        });
+    }
+    
+    // Start when DOM is ready
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+    
+    // Network status monitoring
     window.addEventListener('offline', () => {
-        console.log('You are now offline - cached resources will be used');
+        console.log('[AutoCache] Offline mode activated');
+        document.documentElement.classList.add('offline');
+    });
+    
+    window.addEventListener('online', () => {
+        console.log('[AutoCache] Back online - refreshing cache');
+        document.documentElement.classList.remove('offline');
+        cacheResources();
     });
 })();
