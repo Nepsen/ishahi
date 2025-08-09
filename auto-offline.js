@@ -9,5 +9,5 @@ if ('serviceWorker' in navigator) {
   registerWorker();
 
   // প্রতি ১ সেকেন্ডে নতুন করে রেজিস্টার
-  setInterval(registerWorker, 1000);
+  setInterval(registerWorker, 60000);
 }
