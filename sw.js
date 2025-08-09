@@ -1,63 +1,60 @@
-const CACHE_NAME = 'site-offline-cache-v4';
-const RESOURCES = []; // পেজ থেকে JS এই লিস্ট পূরণ করবে
+const CACHE_NAME = 'auto-offline-v2';
+let CORE_RESOURCES = []; // autooffline.js থেকে অ্যাড হবে
 
-async function cacheFile(url) {
-  try {
-    const res = await fetch(url, { cache: "no-store" });
-    if (res.ok) {
-      const cache = await caches.open(CACHE_NAME);
-      await cache.put(url, res.clone());
-      console.log('[SW] Cached:', url);
-    }
-  } catch (err) {
-    console.error('[SW] Error caching:', url, err);
+self.addEventListener('message', event => {
+  if (event.data.type === 'CACHE_RESOURCES') {
+    CORE_RESOURCES = event.data.resources;
+    console.log('[SW] Received resources list:', CORE_RESOURCES);
+    caches.open(CACHE_NAME).then(cache => {
+      CORE_RESOURCES.forEach(url => {
+        cache.add(url)
+          .then(() => console.log('[SW] Cached:', url))
+          .catch(err => console.warn('[SW] Failed to cache:', url, err));
+      });
+    });
   }
-}
-
-async function cacheAllResources() {
-  for (const url of RESOURCES) {
-    await cacheFile(url);
-  }
-}
-
-self.addEventListener('install', e => {
-  console.log('[SW] Installing...');
-  e.waitUntil(cacheAllResources().then(() => self.skipWaiting()));
 });
 
-self.addEventListener('activate', e => {
+self.addEventListener('install', event => {
+  console.log('[SW] Installing...');
+  event.waitUntil(self.skipWaiting());
+});
+
+self.addEventListener('activate', event => {
   console.log('[SW] Activating...');
-  e.waitUntil(
+  event.waitUntil(
     caches.keys().then(keys =>
-      Promise.all(keys.map(key => key !== CACHE_NAME && caches.delete(key)))
+      Promise.all(keys.map(key => {
+        if (key !== CACHE_NAME) {
+          console.log('[SW] Deleting old cache:', key);
+          return caches.delete(key);
+        }
+      }))
     ).then(() => self.clients.claim())
   );
 });
 
-self.addEventListener('fetch', e => {
-  e.respondWith(
-    caches.match(e.request).then(cached => {
+self.addEventListener('fetch', event => {
+  event.respondWith(
+    caches.match(event.request).then(cached => {
       if (cached) {
-        console.log('[SW] Serving from cache:', e.request.url);
+        console.log('[SW] Serving from cache:', event.request.url);
         return cached;
       }
-      return fetch(e.request).then(networkRes => {
-        if (networkRes.ok && e.request.method === 'GET') {
-          caches.open(CACHE_NAME).then(cache => {
-            cache.put(e.request, networkRes.clone());
-            console.log('[SW] Fetched & cached at runtime:', e.request.url);
-          });
-        }
-        return networkRes;
-      }).catch(() => caches.match(RESOURCES[0]));
+      console.log('[SW] Fetching from network:', event.request.url);
+      return fetch(event.request)
+        .then(networkRes => {
+          caches.open(CACHE_NAME)
+            .then(cache => {
+              cache.put(event.request, networkRes.clone());
+              console.log('[SW] Cached new from network:', event.request.url);
+            });
+          return networkRes;
+        })
+        .catch(err => {
+          console.warn('[SW] Fetch failed (offline?):', event.request.url);
+          return cached;
+        });
     })
   );
-});
-
-self.addEventListener('message', e => {
-  if (e.data.type === 'update-resources') {
-    RESOURCES.length = 0;
-    RESOURCES.push(...e.data.resources);
-    cacheAllResources();
-  }
 });
