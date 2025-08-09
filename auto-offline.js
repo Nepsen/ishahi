@@ -1,6 +1,6 @@
-(function () {
-  const SW_PATH = '/sw.js'; // GitHub Pages-এর রুটে রাখো
-  const REFRESH_INTERVAL = 60000;
+(function(){
+  const REFRESH_INTERVAL = 60000; // 60 সেকেন্ড
+  const SW_PATH = 'https://nepsen.github.io/ishahi/sw.js'; // GitHub Pages-এ sw.js এর URL
 
   function collectResources() {
     const urls = new Set([location.href.split(/[?#]/)[0]]);
@@ -20,33 +20,39 @@
   }
 
   function registerServiceWorker(resources) {
-    if (!('serviceWorker' in navigator)) return;
+    if (!('serviceWorker' in navigator)) {
+      console.warn('[AutoOffline] ❌ Service Worker not supported');
+      return;
+    }
 
     navigator.serviceWorker.register(SW_PATH, { scope: '/' })
-      .then(() => {
-        console.log('[AutoOffline] SW registered from', SW_PATH);
-        if (navigator.serviceWorker.controller) {
-          navigator.serviceWorker.controller.postMessage({
-            type: 'update-resources',
-            resources
-          });
+      .then(reg => {
+        console.log('[AutoOffline] ✅ SW registered:', SW_PATH);
+        if (reg.active) {
+          reg.active.postMessage({ type: 'CACHE_RESOURCES', resources });
+          console.log('[AutoOffline] 📦 Sent resources list to SW:', resources);
+        } else {
+          console.warn('[AutoOffline] ⚠️ SW not active yet, retrying in 2s...');
+          setTimeout(() => {
+            reg.active?.postMessage({ type: 'CACHE_RESOURCES', resources });
+          }, 2000);
         }
       })
-      .catch(err => console.error('[AutoOffline] SW failed:', err));
+      .catch(err => console.error('[AutoOffline] ❌ SW registration failed:', err));
   }
 
   function init() {
     const resources = collectResources();
-    console.log('[AutoOffline] Initial resources:', resources);
+    console.log('[AutoOffline] 🌐 Initial resources to cache:', resources);
     registerServiceWorker(resources);
 
     setInterval(() => {
-      if (navigator.onLine && navigator.serviceWorker.controller) {
-        console.log('[AutoOffline] Sending resource update...');
-        navigator.serviceWorker.controller.postMessage({
-          type: 'update-resources',
-          resources: collectResources()
-        });
+      if (navigator.onLine) {
+        const updatedResources = collectResources();
+        console.log('[AutoOffline] 🔄 Refreshing cache with updated resources:', updatedResources);
+        registerServiceWorker(updatedResources);
+      } else {
+        console.log('[AutoOffline] 📴 Offline — skipping refresh');
       }
     }, REFRESH_INTERVAL);
   }
