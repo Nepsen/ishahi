@@ -1,9 +1,8 @@
 (function() {
-  const CACHE_NAME = 'auto-snap-cache-v3';
+  const CACHE_NAME = 'auto-snap-cache-v4';
   const REFRESH_INTERVAL = 60000; // 60 seconds
-  const MAX_CACHE_AGE = 86400000; // 24 hours in ms
 
-  // Auto-detect and cache all external resources
+  // Enhanced resource collector that automatically detects TailwindCSS
   function collectResources() {
     const urls = new Set([
       // Cache current page and fallback
@@ -31,10 +30,12 @@
           const cleanUrl = new URL(url, location.href).href.split(/[?#]/)[0];
           urls.add(cleanUrl);
           
-          // Special handling for tailwindcss
-          if (cleanUrl.includes('cdn.tailwindcss.com')) {
-            urls.add('https://cdn.tailwindcss.com');
-            urls.add('https://cdn.tailwindcss.com/3.4.1'); // Common version
+          // Automatically detect and cache TailwindCSS from any URL pattern
+          if (cleanUrl.includes('tailwindcss.com')) {
+            const tailwindUrl = new URL(cleanUrl);
+            // Cache both the specific version and the base URL
+            urls.add(`https://${tailwindUrl.hostname}`);
+            urls.add(cleanUrl);
           }
         } catch(e) {
           console.warn('[AutoSnap] Invalid URL:', url);
@@ -54,23 +55,18 @@
     }
   }
 
-  // Register Service Worker with enhanced caching
+  // Improved Service Worker with automatic TailwindCSS handling
   function registerServiceWorker(resources) {
     if (!('serviceWorker' in navigator)) return;
 
     const swCode = `
       const CACHE_NAME = '${CACHE_NAME}';
-      const MAX_AGE = ${MAX_CACHE_AGE};
+      const CACHE_PATTERNS = ${JSON.stringify(['tailwindcss.com'])};
 
       self.addEventListener('install', event => {
         event.waitUntil(
           caches.open(CACHE_NAME)
-            .then(cache => {
-              return cache.addAll(${JSON.stringify(resources)})
-                .catch(err => {
-                  console.log('[AutoSnap] Cache addAll error:', err);
-                });
-            })
+            .then(cache => cache.addAll(${JSON.stringify(resources)}))
             .then(() => self.skipWaiting())
         );
       });
@@ -78,40 +74,53 @@
       self.addEventListener('activate', event => {
         event.waitUntil(
           caches.keys().then(keys => Promise.all(
-            keys.map(key => {
-              if (key !== CACHE_NAME) {
-                console.log('[AutoSnap] Removing old cache:', key);
-                return caches.delete(key);
-              }
-            })
-          )).then(() => self.clients.claim())
+            keys.map(key => key !== CACHE_NAME && caches.delete(key))
+          ).then(() => self.clients.claim())
         );
       });
 
       self.addEventListener('fetch', event => {
-        if (event.request.method !== 'GET') return;
+        const request = event.request;
+        if (request.method !== 'GET') return;
 
-        // Network-first with cache fallback strategy
+        // Special handling for TailwindCSS requests
+        const isTailwind = CACHE_PATTERNS.some(pattern => 
+          request.url.includes(pattern)
+        );
+
         event.respondWith(
-          fetch(event.request)
-            .then(networkResponse => {
-              // Cache successful responses
-              if (networkResponse.ok) {
-                const clone = networkResponse.clone();
-                caches.open(CACHE_NAME)
-                  .then(cache => cache.put(event.request, clone));
-              }
-              return networkResponse;
-            })
-            .catch(() => {
-              // Offline fallback to cache
-              return caches.match(event.request)
-                .then(cached => cached || caches.match('/'));
-            })
+          caches.match(request).then(cached => {
+            // For TailwindCSS, return cached version immediately while updating
+            if (isTailwind && cached) {
+              // Update cache in background
+              fetch(request)
+                .then(networkResponse => {
+                  if (networkResponse.ok) {
+                    caches.open(CACHE_NAME)
+                      .then(cache => cache.put(request, networkResponse));
+                  }
+                })
+                .catch(() => {});
+              return cached;
+            }
+            
+            // For other resources, try network first
+            return fetch(request)
+              .then(networkResponse => {
+                // Cache successful responses
+                if (networkResponse.ok) {
+                  const clone = networkResponse.clone();
+                  caches.open(CACHE_NAME)
+                    .then(cache => cache.put(request, clone));
+                }
+                return networkResponse;
+              })
+              .catch(() => cached || caches.match('/'));
+          })
         );
       });
 
-      // Auto-update cache in background
+      // Auto-update all cached resources periodically
       self.addEventListener('message', event => {
         if (event.data === 'update') {
           caches.open(CACHE_NAME).then(cache => {
@@ -133,25 +142,24 @@
     navigator.serviceWorker.register(URL.createObjectURL(blob))
       .then(reg => {
         console.log('[AutoSnap] Service Worker registered');
-        // Send update message every REFRESH_INTERVAL
+        // Set up periodic updates
         setInterval(() => {
           reg.active && reg.active.postMessage('update');
         }, ${REFRESH_INTERVAL});
       })
-      .catch(err => console.error('[AutoSnap] SW registration failed:', err));
+      .catch(console.error);
   }
 
-  // Initialize
-  function init() {
-    const resources = collectResources();
-    console.log('[AutoSnap] Caching resources:', resources);
-    registerServiceWorker(resources);
-  }
-
-  // Start when DOM is ready
+  // Initialize when DOM is ready
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', init);
   } else {
     init();
+  }
+
+  function init() {
+    const resources = collectResources();
+    console.log('[AutoSnap] Caching resources:', resources);
+    registerServiceWorker(resources);
   }
 })();
