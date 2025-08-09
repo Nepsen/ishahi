@@ -1,102 +1,172 @@
-const CACHE_NAME = 'offline-cache-v1';
-const UPDATE_INTERVAL = 100; // 1 min
-const urlsToCache = new Set();
+const CACHE_VERSION = 'auto-cache-v1';
+const CACHE_NAME = `${CACHE_VERSION}-${self.registration.scope}`;
+const MAX_CACHE_ITEMS = 100; // Limit cache size
+const MAX_CACHE_AGE = 365 * 24 * 60 * 60 * 1000; // 1 week
 
-async function fetchAndCache(request) {
-  try {
-    const response = await fetch(request);
-    if (response && response.status === 200) {
-      const cache = await caches.open(CACHE_NAME);
-      await cache.put(request, response.clone());
-      return response;
-    }
-  } catch {}
-  return caches.match(request);
-}
+// Auto-detected cacheable content types
+const AUTO_CACHE_TYPES = [
+  'text/html',
+  'text/css',
+  'application/javascript',
+  'image/',
+  'font/',
+  'application/json'
+];
 
-// Helper to resolve relative URLs against base URL
-function resolveUrl(url, base) {
-  try {
-    return new URL(url, base).href;
-  } catch {
-    return url;
-  }
-}
+// Track seen requests for auto-caching
+const seenRequests = new Set();
 
 self.addEventListener('install', event => {
-  event.waitUntil((async () => {
-    const cache = await caches.open(CACHE_NAME);
-
-    // Get the URL of the page this SW controls (its scope)
-    // This is usually the directory containing the SW script
-    const clients = await self.clients.matchAll({type: 'window'});
-    if (clients.length === 0) return; // no clients yet
-
-    const pageUrl = clients[0].url;
-
-    // Cache the main page
-    const mainResponse = await fetch(pageUrl);
-    const text = await mainResponse.text();
-
-    urlsToCache.add(pageUrl);
-
-    // Extract all linked assets (href/src) from HTML
-    const regex = /(?:href|src)=["']([^"']+)["']/g;
-    let match;
-    while ((match = regex.exec(text)) !== null) {
-      let url = match[1];
-      // Convert relative URLs to absolute
-      const absoluteUrl = resolveUrl(url, pageUrl);
-      if (absoluteUrl.startsWith(self.location.origin)) {
-        urlsToCache.add(absoluteUrl);
-      }
-    }
-
-    // Cache all discovered URLs
-    await Promise.all(
-      Array.from(urlsToCache).map(url => fetchAndCache(url).catch(() => {}))
-    );
-
-    self.skipWaiting();
-  })());
+  // Skip waiting to activate immediately
+  self.skipWaiting();
+  console.log('Auto-offline service worker installed');
 });
 
 self.addEventListener('activate', event => {
   event.waitUntil((async () => {
+    // Clean up old caches
     const keys = await caches.keys();
-    await Promise.all(
-      keys.map(key => (key !== CACHE_NAME) ? caches.delete(key) : null)
-    );
-    self.clients.claim();
+    await Promise.all(keys.map(key => {
+      if (key.startsWith('auto-cache-') && key !== CACHE_NAME) {
+        return caches.delete(key);
+      }
+    }));
+    
+    // Claim all clients immediately
+    await self.clients.claim();
+    console.log('Auto-offline service worker activated');
   })());
 });
 
 self.addEventListener('fetch', event => {
+  const request = event.request;
+  const url = new URL(request.url);
+  
+  // Skip non-GET requests and chrome-extension URLs
+  if (request.method !== 'GET' || url.protocol === 'chrome-extension:') {
+    return;
+  }
+  
+  // Skip third-party requests unless they match cacheable types
+  const isSameOrigin = url.origin === location.origin;
+  const isCacheableType = AUTO_CACHE_TYPES.some(type => 
+    request.headers.get('Accept')?.includes(type)
+  );
+  
+  if (!isSameOrigin && !isCacheableType) {
+    return;
+  }
+  
+  // Track this request for future auto-caching
+  if (!seenRequests.has(request.url)) {
+    seenRequests.add(request.url);
+    if (seenRequests.size > MAX_CACHE_ITEMS) {
+      // Remove oldest entry if we exceed limit
+      const oldest = seenRequests.values().next().value;
+      seenRequests.delete(oldest);
+    }
+  }
+  
+  // Network-first strategy with fallback to cache
   event.respondWith((async () => {
     try {
-      const networkResponse = await fetch(event.request);
-      if (event.request.method === 'GET') {
+      // Try network first
+      const networkResponse = await fetch(request);
+      
+      // Cache successful responses
+      if (networkResponse.ok) {
         const cache = await caches.open(CACHE_NAME);
-        cache.put(event.request, networkResponse.clone());
+        cache.put(request, networkResponse.clone()).catch(() => {});
       }
+      
       return networkResponse;
-    } catch {
-      return caches.match(event.request) || new Response('Offline', { status: 503 });
+    } catch (err) {
+      // Network failed - try cache
+      const cachedResponse = await caches.match(request);
+      
+      if (cachedResponse) {
+        return cachedResponse;
+      }
+      
+      // For HTML requests, return a simple offline page
+      if (request.headers.get('Accept')?.includes('text/html')) {
+        return new Response(`
+          <!DOCTYPE html>
+          <html>
+            <head>
+              <title>Offline</title>
+              <style>
+                body { font-family: sans-serif; text-align: center; padding: 2em; }
+              </style>
+            </head>
+            <body>
+              <h1>You're offline</h1>
+              <p>This page will be available when you reconnect to the internet.</p>
+            </body>
+          </html>
+        `, {
+          headers: { 'Content-Type': 'text/html' }
+        });
+      }
+      
+      return new Response('Offline', { status: 503 });
     }
   })());
 });
 
-// Update cache every minute
-setInterval(async () => {
-  if (self.navigator?.onLine ?? true) {
-    const cache = await caches.open(CACHE_NAME);
-    for (const url of urlsToCache) {
-      try {
-        const response = await fetch(url);
-        if (response && response.status === 200) {
-          await cache.put(url, response.clone());
-        }
-      } catch {}
+// Background cache updating
+self.addEventListener('message', event => {
+  if (event.data === 'updateCache') {
+    updateCache();
+  }
+});
+
+async function updateCache() {
+  if (!await isOnline()) return;
+  
+  const cache = await caches.open(CACHE_NAME);
+  const now = Date.now();
+  
+  // Update all seen requests
+  for (const url of seenRequests) {
+    try {
+      const response = await fetch(url);
+      if (response.ok) {
+        await cache.put(url, response);
+      }
+    } catch (err) {
+      console.log(`Failed to update ${url}:`, err);
     }
   }
-}, UPDATE_INTERVAL);
+  
+  // Clean old cache entries
+  const requests = await cache.keys();
+  for (const request of requests) {
+    const response = await cache.match(request);
+    if (!response) continue;
+    
+    const date = new Date(response.headers.get('date') || now);
+    const age = now - date.getTime();
+    
+    if (age > MAX_CACHE_AGE) {
+      await cache.delete(request);
+      seenRequests.delete(request.url);
+    }
+  }
+}
+
+async function isOnline() {
+  try {
+    const response = await fetch(location.origin, {
+      method: 'HEAD',
+      cache: 'no-store',
+      timeout: 3000
+    });
+    return response.ok;
+  } catch {
+    return false;
+  }
+}
+
+// Update cache every hour
+setInterval(updateCache, 60 * 60 * 1000);
