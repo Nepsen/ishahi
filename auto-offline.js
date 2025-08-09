@@ -1,6 +1,6 @@
 (function() {
   const REFRESH_INTERVAL = 60000; // 60 সেকেন্ডে একবার আপডেট করে
-  const SW_PATH = '/sw.js'; // Service Worker ফাইল (GitHub Pages-এ একই ফোল্ডারে রাখুন)
+  const SW_PATH = '/ishahi/sw.js'; // Service Worker ফাইল (GitHub Pages-এ একই ফোল্ডারে রাখুন)
 
   // ওয়েবসাইটের সকল প্রয়োজনীয় রিসোর্স সংগ্রহ করে
   function collectResources() {
