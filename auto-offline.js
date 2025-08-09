@@ -1,118 +1,85 @@
-// autooffline.js
-(() => {
-  const CACHE_NAME = 'autooffline-cache-v1';
-  const REFRESH_INTERVAL = 60000; // 60 seconds
+const CACHE_NAME = 'offline-cache-v1';
+const UPDATE_INTERVAL = 60000;
+let urlsToCache = new Set();
 
-  // Collect all resources to cache dynamically from the page
-  function collectResources() {
-    const urls = new Set([location.href.split(/[?#]/)[0]]); // page itself
-
-    document.querySelectorAll(`
-      link[href], script[src], img[src], source[src],
-      video[src], audio[src], iframe[src], embed[src],
-      object[data], link[rel*="icon"][href], link[rel="manifest"][href]
-    `).forEach(el => {
-      let url = el.href || el.src || el.data;
-      if (url) {
-        try {
-          url = new URL(url, location.href).href.split(/[?#]/)[0];
-          urls.add(url);
-        } catch(e) {}
-      }
-    });
-
-    console.log('[AutoOffline] Resources to cache:', Array.from(urls));
-    return Array.from(urls);
-  }
-
-  // Register Service Worker from inline script blob
-  function registerServiceWorker(resources) {
-    if (!('serviceWorker' in navigator)) {
-      console.warn('[AutoOffline] Service Worker not supported');
-      return;
+async function fetchAndCache(request) {
+  try {
+    const response = await fetch(request);
+    if (response && response.status === 200) {
+      const cache = await caches.open(CACHE_NAME);
+      cache.put(request, response.clone());
+      return response;
     }
+  } catch {}
+  return caches.match(request);
+}
 
-    const swCode = `
-      const CACHE_NAME = '${CACHE_NAME}';
-      const RESOURCES = ${JSON.stringify(resources)};
+self.addEventListener('install', event => {
+  event.waitUntil(
+    (async () => {
+      const cache = await caches.open(CACHE_NAME);
+      const response = await fetch('/ishahi/index.html');
+      const text = await response.text();
 
-      self.addEventListener('install', e => {
-        console.log('[SW] Installing and caching resources...');
-        e.waitUntil(
-          caches.open(CACHE_NAME).then(cache => cache.addAll(RESOURCES)).then(() => self.skipWaiting())
-        );
-      });
+      urlsToCache.add('/ishahi/index.html');
 
-      self.addEventListener('activate', e => {
-        console.log('[SW] Activating and cleaning old caches...');
-        e.waitUntil(
-          caches.keys().then(keys =>
-            Promise.all(keys.map(key => {
-              if (key !== CACHE_NAME) {
-                console.log('[SW] Deleting old cache:', key);
-                return caches.delete(key);
-              }
-            }))
-          ).then(() => self.clients.claim())
-        );
-      });
-
-      self.addEventListener('fetch', e => {
-        e.respondWith(
-          caches.match(e.request).then(cachedResponse => {
-            if (cachedResponse) {
-              console.log('[SW] Serving from cache:', e.request.url);
-              return cachedResponse;
-            }
-            return fetch(e.request).then(networkResponse => {
-              if (!networkResponse || networkResponse.status !== 200 || networkResponse.type !== 'basic') {
-                return networkResponse;
-              }
-              caches.open(CACHE_NAME).then(cache => {
-                cache.put(e.request, networkResponse.clone());
-                console.log('[SW] Cached new resource:', e.request.url);
-              });
-              return networkResponse;
-            }).catch(() => {
-              console.log('[SW] Fetch failed, offline or resource missing:', e.request.url);
-              return cachedResponse;
-            });
-          })
-        );
-      });
-    `;
-
-    const blob = new Blob([swCode], { type: 'application/javascript' });
-    const swUrl = URL.createObjectURL(blob);
-
-    navigator.serviceWorker.register(swUrl).then(() => {
-      console.log('[AutoOffline] Service Worker registered');
-    }).catch(err => {
-      console.error('[AutoOffline] SW registration failed:', err);
-    });
-  }
-
-  function init() {
-    if (!navigator.serviceWorker) {
-      console.warn('[AutoOffline] Service Worker not supported');
-      return;
-    }
-
-    let resources = collectResources();
-    registerServiceWorker(resources);
-
-    setInterval(() => {
-      if (navigator.onLine) {
-        console.log('[AutoOffline] Refreshing cache...');
-        resources = collectResources();
-        registerServiceWorker(resources);
+      const regex = /(?:href|src)="([^"]+)"/g;
+      let match;
+      while ((match = regex.exec(text)) !== null) {
+        let url = match[1];
+        if (!url.startsWith('http') && !url.startsWith('//')) {
+          if (!url.startsWith('/')) url = '/ishahi/' + url;
+          urlsToCache.add(url);
+        }
       }
-    }, REFRESH_INTERVAL);
-  }
 
-  if (document.readyState === 'loading') {
-    document.addEventListener('DOMContentLoaded', init);
-  } else {
-    init();
+      await Promise.all(
+        Array.from(urlsToCache).map(url => fetchAndCache(url).catch(() => {}))
+      );
+      self.skipWaiting();
+    })()
+  );
+});
+
+self.addEventListener('activate', event => {
+  event.waitUntil(
+    (async () => {
+      const keys = await caches.keys();
+      await Promise.all(keys.map(key => {
+        if (key !== CACHE_NAME) return caches.delete(key);
+      }));
+      self.clients.claim();
+    })()
+  );
+});
+
+self.addEventListener('fetch', event => {
+  event.respondWith(
+    (async () => {
+      try {
+        const networkResponse = await fetch(event.request);
+        if (event.request.method === 'GET') {
+          const cache = await caches.open(CACHE_NAME);
+          cache.put(event.request, networkResponse.clone());
+        }
+        return networkResponse;
+      } catch {
+        return caches.match(event.request) || new Response('Offline', { status: 503 });
+      }
+    })()
+  );
+});
+
+setInterval(async () => {
+  if (self.navigator?.onLine ?? true) {
+    const cache = await caches.open(CACHE_NAME);
+    for (const url of urlsToCache) {
+      try {
+        const response = await fetch(url);
+        if (response && response.status === 200) {
+          await cache.put(url, response.clone());
+        }
+      } catch {}
+    }
   }
-})();
+}, UPDATE_INTERVAL);
