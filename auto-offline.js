@@ -1,7 +1,6 @@
-
 (function () {
-  const CACHE_NAME = 'auto-snap-cache-v2';
-  const REFRESH_INTERVAL = 60000; // 60 sec
+  const CACHE_NAME = 'site-offline-cache-v1';
+  const REFRESH_INTERVAL = 60000; // 60 সেকেন্ড
 
   function collectResources() {
     const urls = new Set([location.href.split(/[?#]/)[0]]);
@@ -27,15 +26,28 @@
       const CACHE_NAME = '${CACHE_NAME}';
       const RESOURCES = ${JSON.stringify(resources)};
 
+      async function cacheAll() {
+        const cache = await caches.open(CACHE_NAME);
+        for (const url of RESOURCES) {
+          try {
+            const res = await fetch(url, { cache: "no-store" });
+            if (res.ok) {
+              await cache.put(url, res.clone());
+              console.log('[SW] Cached:', url);
+            }
+          } catch (err) {
+            console.warn('[SW] Failed to cache:', url, err);
+          }
+        }
+      }
+
       self.addEventListener('install', e => {
-        e.waitUntil(
-          caches.open(CACHE_NAME)
-            .then(cache => cache.addAll(RESOURCES))
-            .then(() => self.skipWaiting())
-        );
+        console.log('[SW] Installing...');
+        e.waitUntil(cacheAll().then(() => self.skipWaiting()));
       });
 
       self.addEventListener('activate', e => {
+        console.log('[SW] Activating...');
         e.waitUntil(
           caches.keys().then(keys =>
             Promise.all(keys.map(key => key !== CACHE_NAME && caches.delete(key)))
@@ -46,48 +58,45 @@
       self.addEventListener('fetch', e => {
         e.respondWith(
           caches.match(e.request).then(cached => {
-            if (cached) return cached;
+            if (cached) {
+              console.log('[SW] Serving from cache:', e.request.url);
+              return cached;
+            }
             return fetch(e.request).then(networkRes => {
-              if (networkRes && networkRes.status === 200 && e.request.method === 'GET') {
-                caches.open(CACHE_NAME).then(cache => cache.put(e.request, networkRes.clone()));
+              if (networkRes.ok && e.request.method === 'GET') {
+                caches.open(CACHE_NAME).then(cache => {
+                  cache.put(e.request, networkRes.clone());
+                  console.log('[SW] Fetched & cached:', e.request.url);
+                });
               }
               return networkRes;
-            });
-          }).catch(() => caches.match(RESOURCES[0])) // offline fallback to main page
+            }).catch(() => caches.match(RESOURCES[0])); // main page fallback
+          })
         );
       });
 
-      // Background update every fetch
       self.addEventListener('message', e => {
         if (e.data === 'update-cache') {
-          fetchAllAndUpdate();
+          console.log('[SW] Updating cache...');
+          cacheAll();
         }
       });
-
-      function fetchAllAndUpdate() {
-        caches.open(CACHE_NAME).then(cache => {
-          RESOURCES.forEach(url => {
-            fetch(url).then(res => {
-              if (res.ok) cache.put(url, res.clone());
-            }).catch(() => {});
-          });
-        });
-      }
     `;
 
     const blob = new Blob([swCode], { type: 'application/javascript' });
-    navigator.serviceWorker.register(URL.createObjectURL(blob))
-      .then(() => console.log('[AutoSnap] SW registered'))
-      .catch(err => console.error('[AutoSnap] SW failed:', err));
+    navigator.serviceWorker.register(URL.createObjectURL(blob), { scope: '/' })
+      .then(() => console.log('[AutoOffline] SW registered for entire site'))
+      .catch(err => console.error('[AutoOffline] SW failed:', err));
   }
 
   function init() {
     const resources = collectResources();
+    console.log('[AutoOffline] Initial resources:', resources);
     registerServiceWorker(resources);
 
-    // Tell SW to refresh cache every 60s if online
     setInterval(() => {
       if (navigator.onLine && navigator.serviceWorker.controller) {
+        console.log('[AutoOffline] Sending update request...');
         navigator.serviceWorker.controller.postMessage('update-cache');
       }
     }, REFRESH_INTERVAL);
