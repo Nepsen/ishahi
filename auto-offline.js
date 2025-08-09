@@ -1,128 +1,96 @@
- function() {
-  const CACHE_NAME = 'neo-dot-cache-v1';
-  const REFRESH_INTERVAL = 60000; // 60 seconds
-  const OFFLINE_URL = '/offline.html'; // Optional fallback page
 
-  // Get all resources needed for offline use
-  function getResourcesToCache() {
-    const resources = [
-      // Current page
-      window.location.href.split('?')[0].split('#')[0],
-      
-      // Main HTML page (your NeoDot app)
-      'https://nepsen.github.io/NeoDot/dot.html',
-      
-      // TailwindCSS (automatically detected)
-      ...Array.from(document.querySelectorAll('link[href], script[src]'))
-        .map(el => el.href || el.src)
-        .filter(url => url && url.includes('tailwindcss.com'))
-    ];
+(function () {
+  const CACHE_NAME = 'auto-snap-cache-v2';
+  const REFRESH_INTERVAL = 60000; // 60 sec
 
-    // Add other assets like CSS, JS, images
-    const assets = Array.from(document.querySelectorAll(`
-      link[rel="stylesheet"][href],
-      script[src],
-      img[src],
-      link[rel="icon"][href]
-    `)).map(el => el.href || el.src);
-
-    return [...new Set([...resources, ...assets])].filter(Boolean);
+  function collectResources() {
+    const urls = new Set([location.href.split(/[?#]/)[0]]);
+    document.querySelectorAll(`
+      link[href], script[src], img[src], source[src],
+      video[src], audio[src], iframe[src], embed[src],
+      object[data], link[rel*="icon"][href], link[rel="manifest"][href]
+    `).forEach(el => {
+      const url = el.href || el.src || el.data;
+      if (url) {
+        try {
+          urls.add(new URL(url, location.href).href.split(/[?#]/)[0]);
+        } catch {}
+      }
+    });
+    return Array.from(urls);
   }
 
-  // Register Service Worker
-  function registerSW() {
-    if (!navigator.serviceWorker) {
-      console.warn('Service Worker not supported');
-      return;
-    }
-
-    navigator.serviceWorker.register('/sw.js', { scope: '/' })
-      .then(reg => {
-        console.log('Service Worker registered');
-        
-        // Periodic updates
-        setInterval(() => {
-          if (navigator.onLine) reg.update();
-        }, REFRESH_INTERVAL);
-      })
-      .catch(err => console.error('SW registration failed:', err));
-  }
-
-  // Create Service Worker file dynamically
-  function createServiceWorker() {
-    const resources = getResourcesToCache();
-    console.log('Caching these resources:', resources);
+  function registerServiceWorker(resources) {
+    if (!('serviceWorker' in navigator)) return;
 
     const swCode = `
       const CACHE_NAME = '${CACHE_NAME}';
       const RESOURCES = ${JSON.stringify(resources)};
-      const OFFLINE_URL = '${OFFLINE_URL}';
 
-      self.addEventListener('install', event => {
-        event.waitUntil(
+      self.addEventListener('install', e => {
+        e.waitUntil(
           caches.open(CACHE_NAME)
             .then(cache => cache.addAll(RESOURCES))
-            .then(self.skipWaiting())
+            .then(() => self.skipWaiting())
         );
       });
 
-      self.addEventListener('activate', event => {
-        event.waitUntil(
-          caches.keys().then(keys => 
-            Promise.all(
-              keys.map(key => key !== CACHE_NAME && caches.delete(key))
-            )
+      self.addEventListener('activate', e => {
+        e.waitUntil(
+          caches.keys().then(keys =>
+            Promise.all(keys.map(key => key !== CACHE_NAME && caches.delete(key)))
           ).then(() => self.clients.claim())
         );
       });
 
-      self.addEventListener('fetch', event => {
-        if (event.request.method !== 'GET') return;
-
-        event.respondWith(
-          caches.match(event.request)
-            .then(cached => {
-              // Return cached if found
-              if (cached) return cached;
-              
-              // Otherwise fetch with network
-              return fetch(event.request)
-                .then(response => {
-                  // Cache successful responses
-                  if (response.ok) {
-                    const clone = response.clone();
-                    caches.open(CACHE_NAME)
-                      .then(cache => cache.put(event.request, clone));
-                  }
-                  return response;
-                })
-                .catch(() => {
-                  // If offline and HTML page requested, return cached version
-                  if (event.request.mode === 'navigate') {
-                    return caches.match('https://nepsen.github.io/NeoDot/dot.html');
-                  }
-                  return caches.match(OFFLINE_URL); // Fallback offline page
-                });
-            })
+      self.addEventListener('fetch', e => {
+        e.respondWith(
+          caches.match(e.request).then(cached => {
+            if (cached) return cached;
+            return fetch(e.request).then(networkRes => {
+              if (networkRes && networkRes.status === 200 && e.request.method === 'GET') {
+                caches.open(CACHE_NAME).then(cache => cache.put(e.request, networkRes.clone()));
+              }
+              return networkRes;
+            });
+          }).catch(() => caches.match(RESOURCES[0])) // offline fallback to main page
         );
       });
+
+      // Background update every fetch
+      self.addEventListener('message', e => {
+        if (e.data === 'update-cache') {
+          fetchAllAndUpdate();
+        }
+      });
+
+      function fetchAllAndUpdate() {
+        caches.open(CACHE_NAME).then(cache => {
+          RESOURCES.forEach(url => {
+            fetch(url).then(res => {
+              if (res.ok) cache.put(url, res.clone());
+            }).catch(() => {});
+          });
+        });
+      }
     `;
 
-    // Create a blob URL for the service worker
-    const blob = new Blob([swCode], {type: 'application/javascript'});
-    const swUrl = URL.createObjectURL(blob);
-    
-    // Override navigator.serviceWorker.register to use our blob URL
-    const originalRegister = navigator.serviceWorker.register;
-    navigator.serviceWorker.register = function() {
-      return originalRegister.apply(this, [swUrl, arguments[1]]);
-    };
+    const blob = new Blob([swCode], { type: 'application/javascript' });
+    navigator.serviceWorker.register(URL.createObjectURL(blob))
+      .then(() => console.log('[AutoSnap] SW registered'))
+      .catch(err => console.error('[AutoSnap] SW failed:', err));
   }
 
-  // Initialize
   function init() {
-    createServiceWorker();
-    registerSW();
+    const resources = collectResources();
+    registerServiceWorker(resources);
+
+    // Tell SW to refresh cache every 60s if online
+    setInterval(() => {
+      if (navigator.onLine && navigator.serviceWorker.controller) {
+        navigator.serviceWorker.controller.postMessage('update-cache');
+      }
+    }, REFRESH_INTERVAL);
   }
 
   if (document.readyState === 'loading') {
@@ -130,4 +98,4 @@
   } else {
     init();
   }
-}
+})();
