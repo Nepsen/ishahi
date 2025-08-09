@@ -1,5 +1,5 @@
 const CACHE_NAME = 'offline-cache-v1';
-const UPDATE_INTERVAL = 60000; // 1 min
+const UPDATE_INTERVAL = 100; // 1 min
 const urlsToCache = new Set();
 
 async function fetchAndCache(request) {
