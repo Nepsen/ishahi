@@ -1,40 +1,45 @@
-const CACHE_NAME = 'offline-mirror-auto-v1';
-const UPDATE_INTERVAL = 10000; // প্রতি 10 সেকেন্ডে আপডেট
+const CACHE_NAME = 'offline-mirror-v3';
+const UPDATE_INTERVAL = 1000; // 1 second updates when online
+const urlsToCache = new Set();
 let isOnline = true;
 
-// লগার
+// Enhanced logger with colors and timestamps
 const logger = {
-  log: (...a) => console.log('%c[SW]', 'color: #4CAF50;', new Date().toISOString(), ...a),
-  warn: (...a) => console.warn('%c[SW]', 'color: #FFC107;', new Date().toISOString(), ...a),
-  error: (...a) => console.error('%c[SW]', 'color: #F44336;', new Date().toISOString(), ...a),
-  debug: (...a) => console.debug('%c[SW]', 'color: #2196F3;', new Date().toISOString(), ...a)
+  log: (...args) => console.log('%c[SW]', 'color: #4CAF50;', new Date().toISOString(), ...args),
+  warn: (...args) => console.warn('%c[SW]', 'color: #FFC107;', new Date().toISOString(), ...args),
+  error: (...args) => console.error('%c[SW]', 'color: #F44336;', new Date().toISOString(), ...args),
+  debug: (...args) => console.debug('%c[SW]', 'color: #2196F3;', new Date().toISOString(), ...args)
 };
 
-// পেজ থেকে সব লিংক খোঁজা
+// Enhanced resource discovery
 async function discoverResources(pageUrl) {
   try {
     logger.debug(`Discovering resources for: ${pageUrl}`);
     const response = await fetch(pageUrl);
     const text = await response.text();
-
-    const patterns = [
+    
+    const resourcePatterns = [
       /(?:href|src)=["']([^"']+)["']/g,        // HTML tags
       /url\(["']?([^"')]+)["']?\)/g,           // CSS urls
-      /["']([^"']+\.(?:js|css|png|jpg|jpeg|gif|svg|webp|json|woff2?))["']/g // common files
+      /(?:fetch|axios\.get)\(["']([^"']+)["']\)/g, // API calls
+      /["']([^"']+\.(?:js|css|png|jpg|jpeg|gif|svg|webp|json|woff2?))["']/g // Common files
     ];
-
-    const found = new Set([pageUrl]);
-
-    for (const pattern of patterns) {
+    
+    const discoveredUrls = new Set();
+    
+    for (const pattern of resourcePatterns) {
       let match;
       while ((match = pattern.exec(text)) !== null) {
         const url = resolveUrl(match[1], pageUrl);
-        if (url.startsWith(self.location.origin)) {
-          found.add(url.split('#')[0].split('?')[0]);
+        if (url.startsWith(self.location.origin) || 
+            url.startsWith('http') && new URL(url).hostname === new URL(pageUrl).hostname) {
+          discoveredUrls.add(url.split('#')[0].split('?')[0]); // Remove fragments and queries
         }
       }
     }
-    return found;
+    
+    logger.debug(`Discovered ${discoveredUrls.size} resources for ${pageUrl}`);
+    return discoveredUrls;
   } catch (e) {
     logger.warn(`Resource discovery failed for ${pageUrl}:`, e);
     return new Set();
@@ -49,78 +54,224 @@ function resolveUrl(url, base) {
   }
 }
 
-// রিসোর্স ক্যাশে রাখা
 async function cacheResource(url) {
   try {
     const cache = await caches.open(CACHE_NAME);
-    const res = await fetch(url, { cache: 'reload' });
-    if (res.ok) {
-      await cache.put(url, res.clone());
+    const response = await fetch(url, {
+      headers: { 'Cache-Control': 'no-cache' }, // Bypass HTTP cache
+      cache: 'reload' // Force network request
+    });
+    
+    if (response.ok) {
+      await cache.put(url, response.clone());
       logger.debug(`Cached: ${url}`);
+      
+      // Update localStorage for text resources
+      const contentType = response.headers.get('Content-Type') || '';
+      if (contentType.match(/^(text|application\/json)/)) {
+        const text = await response.text();
+        try {
+          localStorage.setItem(url, text);
+          logger.debug(`Updated localStorage for: ${url}`);
+        } catch (e) {
+          logger.warn(`localStorage quota exceeded for ${url}`);
+        }
+      }
       return true;
     }
   } catch (e) {
-    logger.warn(`Failed to cache: ${url}`, e);
+    logger.warn(`Cache update failed for ${url}:`, e);
   }
   return false;
 }
 
-// সব রিসোর্স অটো ক্যাশ করা
-async function autoCacheAll() {
-  if (!isOnline) return;
+async function cacheResources() {
+  if (!isOnline) {
+    logger.debug('Skipping cache update - offline');
+    return;
+  }
+  
+  logger.debug('Starting cache update cycle');
   const clients = await self.clients.matchAll();
-  for (const client of clients) {
-    const urls = await discoverResources(client.url);
-    for (const url of urls) {
-      await cacheResource(url);
-    }
+  const currentUrl = clients[0]?.url || self.location.href;
+  
+  // Always include current page
+  urlsToCache.add(currentUrl);
+  
+  // Discover new resources
+  const discoveryPromises = Array.from(urlsToCache).map(url => 
+    discoverResources(url).then(discovered => {
+      discovered.forEach(u => urlsToCache.add(u));
+    })
+  );
+  
+  await Promise.all(discoveryPromises);
+  logger.debug(`Total resources to cache: ${urlsToCache.size}`);
+  
+  // Cache all resources in parallel with rate limiting
+  const BATCH_SIZE = 10;
+  const allUrls = Array.from(urlsToCache);
+  
+  for (let i = 0; i < allUrls.length; i += BATCH_SIZE) {
+    const batch = allUrls.slice(i, i + BATCH_SIZE);
+    await Promise.all(batch.map(cacheResource));
+    logger.debug(`Processed batch ${i/BATCH_SIZE + 1}/${Math.ceil(allUrls.length/BATCH_SIZE)}`);
+  }
+  
+  logger.debug('Cache update completed');
+}
+
+// Network status detection
+function updateNetworkStatus() {
+  const wasOnline = isOnline;
+  isOnline = self.navigator?.onLine ?? true;
+  
+  if (isOnline && !wasOnline) {
+    logger.log('Network status: Online');
+    cacheResources();
+  } else if (!isOnline && wasOnline) {
+    logger.log('Network status: Offline');
   }
 }
 
-// ইনস্টল ইভেন্টে অটো ক্যাশ শুরু
 self.addEventListener('install', event => {
-  logger.log('Installing auto cache SW...');
+  logger.log('Installing service worker');
   event.waitUntil((async () => {
-    await autoCacheAll();
+    await cacheResources();
     self.skipWaiting();
+    logger.log('Installation complete');
   })());
 });
 
-// অ্যাক্টিভেট
 self.addEventListener('activate', event => {
-  logger.log('Activating auto cache SW...');
+  logger.log('Activating service worker');
   event.waitUntil((async () => {
     const keys = await caches.keys();
-    await Promise.all(keys.map(k => k !== CACHE_NAME && caches.delete(k)));
+    await Promise.all(
+      keys.map(key => {
+        if (key !== CACHE_NAME) {
+          logger.debug(`Deleting old cache: ${key}`);
+          return caches.delete(key);
+        }
+      })
+    );
     self.clients.claim();
+    updateNetworkStatus();
+    logger.log('Activation complete');
   })());
 });
 
-// ফেচ ইভেন্ট — অফলাইন হলে ক্যাশ ব্যবহার
 self.addEventListener('fetch', event => {
-  if (event.request.method !== 'GET') return;
+  const request = event.request;
+  const url = request.url;
+  
+  // Skip non-GET requests and chrome-extension requests
+  if (request.method !== 'GET' || url.startsWith('chrome-extension://')) {
+    return;
+  }
+  
+  logger.debug(`Fetch: ${url}`);
+  
   event.respondWith((async () => {
+    // Network-first strategy with aggressive caching
+    if (isOnline) {
+      try {
+        const networkResponse = await fetch(request);
+        
+        // Cache the response
+        const cache = await caches.open(CACHE_NAME);
+        await cache.put(request, networkResponse.clone());
+        logger.debug(`Updated cache from network: ${url}`);
+        
+        // Update localStorage for text resources
+        const contentType = networkResponse.headers.get('Content-Type') || '';
+        if (contentType.match(/^(text|application\/json)/)) {
+          const text = await networkResponse.text();
+          try {
+            localStorage.setItem(url, text);
+            logger.debug(`Updated localStorage from network: ${url}`);
+          } catch (e) {
+            logger.warn(`localStorage update failed for ${url}`);
+          }
+        }
+        
+        return networkResponse;
+      } catch (e) {
+        logger.warn(`Network request failed for ${url}:`, e);
+        isOnline = false;
+      }
+    }
+    
+    // Offline fallback
     try {
-      const res = await fetch(event.request);
-      const cache = await caches.open(CACHE_NAME);
-      cache.put(event.request, res.clone());
-      return res;
-    } catch {
-      const cached = await caches.match(event.request);
-      if (cached) return cached;
-      if (event.request.mode === 'navigate') {
-        return new Response('<h1>Offline</h1><p>Cached version not available.</p>', {
+      // Try cache first
+      const cachedResponse = await caches.match(request);
+      if (cachedResponse) {
+        logger.debug(`Serving from cache: ${url}`);
+        return cachedResponse;
+      }
+      
+      // Then try localStorage for text resources
+      const cachedText = localStorage.getItem(url);
+      if (cachedText) {
+        logger.debug(`Serving from localStorage: ${url}`);
+        return new Response(cachedText, {
           headers: { 'Content-Type': 'text/html' }
         });
       }
-      return new Response('Offline', { status: 503 });
+      
+      // For HTML navigation requests, return a generic offline page
+      if (request.mode === 'navigate') {
+        logger.debug(`Returning offline page for: ${url}`);
+        return new Response(
+          `<h1>Offline</h1><p>You're offline. Cached content will be shown when available.</p>`,
+          { headers: { 'Content-Type': 'text/html' } }
+        );
+      }
+    } catch (e) {
+      logger.error(`Offline fallback failed for ${url}:`, e);
     }
+    
+    // Final fallback
+    logger.warn(`No cached version available for ${url}`);
+    return new Response('Offline - Content not available', {
+      status: 503,
+      headers: { 'Content-Type': 'text/plain' }
+    });
   })());
 });
 
-// অনলাইন/অফলাইন ডিটেকশন
-self.addEventListener('online', () => { isOnline = true; autoCacheAll(); });
-self.addEventListener('offline', () => { isOnline = false; });
+// Event listeners for network status
+self.addEventListener('online', () => {
+  logger.log('Online event received');
+  updateNetworkStatus();
+});
 
-// পিরিয়ডিক আপডেট
-setInterval(autoCacheAll, UPDATE_INTERVAL);
+self.addEventListener('offline', () => {
+  logger.log('Offline event received');
+  updateNetworkStatus();
+});
+
+// Continuous updates when online
+function startUpdateInterval() {
+  setInterval(() => {
+    if (isOnline) {
+      logger.debug('Running periodic cache update');
+      cacheResources();
+    }
+  }, UPDATE_INTERVAL);
+}
+
+// Initialize
+self.addEventListener('message', event => {
+  if (event.data === 'init') {
+    logger.log('Initialization requested');
+    updateNetworkStatus();
+    startUpdateInterval();
+  }
+});
+
+// Start the service worker
+logger.log('Service worker starting');
+updateNetworkStatus();
+startUpdateInterval();
