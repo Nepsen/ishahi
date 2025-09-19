@@ -1,15 +1,28 @@
-const CACHE_NAME = 'offline-mirror-v3';
-const UPDATE_INTERVAL = 1000; // 1 second updates when online
+const CACHE_NAME = 'permanent-offline-v1';
+const UPDATE_INTERVAL = 30000; // 30 seconds updates when online
 const urlsToCache = new Set();
 let isOnline = true;
 
 // Enhanced logger with colors and timestamps
 const logger = {
-  log: (...args) => console.log('%c[SW]', 'color: #4CAF50;', new Date().toISOString(), ...args),
+  log: (...args) => {
+    const message = `[SW] ${new Date().toISOString()} ${args.join(' ')}`;
+    console.log('%c[SW]', 'color: #4CAF50;', new Date().toISOString(), ...args);
+    sendMessageToClients({ type: 'LOG', message });
+  },
   warn: (...args) => console.warn('%c[SW]', 'color: #FFC107;', new Date().toISOString(), ...args),
   error: (...args) => console.error('%c[SW]', 'color: #F44336;', new Date().toISOString(), ...args),
   debug: (...args) => console.debug('%c[SW]', 'color: #2196F3;', new Date().toISOString(), ...args)
 };
+
+// Send message to all clients
+function sendMessageToClients(message) {
+  self.clients.matchAll().then(clients => {
+    clients.forEach(client => {
+      client.postMessage(message);
+    });
+  });
+}
 
 // Enhanced resource discovery
 async function discoverResources(pageUrl) {
@@ -31,10 +44,8 @@ async function discoverResources(pageUrl) {
       let match;
       while ((match = pattern.exec(text)) !== null) {
         const url = resolveUrl(match[1], pageUrl);
-        if (url.startsWith(self.location.origin) || 
-            url.startsWith('http') && new URL(url).hostname === new URL(pageUrl).hostname) {
-          discoveredUrls.add(url.split('#')[0].split('?')[0]); // Remove fragments and queries
-        }
+        // Cache all resources, not just same-origin
+        discoveredUrls.add(url.split('#')[0].split('?')[0]); // Remove fragments and queries
       }
     }
     
@@ -56,33 +67,139 @@ function resolveUrl(url, base) {
 
 async function cacheResource(url) {
   try {
-    const cache = await caches.open(CACHE_NAME);
+    // Check if we already have this resource cached
+    const db = await openIndexedDB();
+    const tx = db.transaction(['resources'], 'readonly');
+    const store = tx.objectStore('resources');
+    const stored = await store.get(url);
+    
+    // Check if we need to update it
+    const headers = new Headers();
+    if (stored && stored.headers && stored.headers.etag) {
+      headers.set('If-None-Match', stored.headers.etag);
+    }
+    
     const response = await fetch(url, {
-      headers: { 'Cache-Control': 'no-cache' }, // Bypass HTTP cache
-      cache: 'reload' // Force network request
+      headers: headers.size > 0 ? headers : undefined,
+      cache: 'no-cache'
     });
     
+    if (response.status === 304) {
+      logger.debug(`Resource not modified: ${url}`);
+      return true; // Still valid
+    }
+    
     if (response.ok) {
-      await cache.put(url, response.clone());
-      logger.debug(`Cached: ${url}`);
-      
-      // Update localStorage for text resources
-      const contentType = response.headers.get('Content-Type') || '';
-      if (contentType.match(/^(text|application\/json)/)) {
-        const text = await response.text();
-        try {
-          localStorage.setItem(url, text);
-          logger.debug(`Updated localStorage for: ${url}`);
-        } catch (e) {
-          logger.warn(`localStorage quota exceeded for ${url}`);
-        }
-      }
+      // Update IndexedDB for persistence
+      await updateIndexedDB(url, response);
+      logger.debug(`Cached resource: ${url}`);
       return true;
     }
   } catch (e) {
     logger.warn(`Cache update failed for ${url}:`, e);
   }
   return false;
+}
+
+// Use IndexedDB for permanent storage
+async function updateIndexedDB(url, response) {
+  try {
+    const db = await openIndexedDB();
+    const tx = db.transaction(['resources'], 'readwrite');
+    const store = tx.objectStore('resources');
+    
+    const blob = await response.blob();
+    const headers = {};
+    
+    // Store important headers
+    if (response.headers.get('etag')) {
+      headers.etag = response.headers.get('etag');
+    }
+    if (response.headers.get('last-modified')) {
+      headers.lastModified = response.headers.get('last-modified');
+    }
+    if (response.headers.get('content-type')) {
+      headers.contentType = response.headers.get('content-type');
+    }
+    
+    await store.put({
+      url: url,
+      data: blob,
+      timestamp: Date.now(),
+      headers: headers,
+      size: blob.size
+    });
+    
+    logger.debug(`Stored in IndexedDB: ${url}`);
+  } catch (e) {
+    logger.warn(`IndexedDB storage failed for ${url}:`, e);
+  }
+}
+
+async function openIndexedDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open('PermanentOfflineDB', 2);
+    
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+    
+    request.onupgradeneeded = (event) => {
+      const db = event.target.result;
+      if (!db.objectStoreNames.contains('resources')) {
+        const store = db.createObjectStore('resources', { keyPath: 'url' });
+        store.createIndex('timestamp', 'timestamp', { unique: false });
+      }
+      
+      // Add size field if it doesn't exist (for v2)
+      if (event.oldVersion < 2) {
+        const store = event.currentTarget.transaction.objectStore('resources');
+        if (!store.indexNames.contains('size')) {
+          store.createIndex('size', 'size', { unique: false });
+        }
+      }
+    };
+  });
+}
+
+async function getCachedResources() {
+  try {
+    const db = await openIndexedDB();
+    const tx = db.transaction(['resources'], 'readonly');
+    const store = tx.objectStore('resources');
+    const allResources = await store.getAll();
+    
+    return allResources.map(resource => ({
+      url: resource.url,
+      type: resource.headers.contentType || 'unknown',
+      size: resource.size || 0
+    }));
+  } catch (e) {
+    logger.error('Error getting cached resources:', e);
+    return [];
+  }
+}
+
+async function getStorageUsage() {
+  try {
+    if (navigator.storage && navigator.storage.estimate) {
+      const estimate = await navigator.storage.estimate();
+      const percent = (estimate.usage / estimate.quota * 100);
+      
+      return {
+        used: estimate.usage,
+        quota: estimate.quota,
+        percent: percent
+      };
+    }
+  } catch (e) {
+    logger.error('Error getting storage estimate:', e);
+  }
+  
+  return {
+    used: 0,
+    quota: 0,
+    percent: 0
+  };
 }
 
 async function cacheResources() {
@@ -109,7 +226,7 @@ async function cacheResources() {
   logger.debug(`Total resources to cache: ${urlsToCache.size}`);
   
   // Cache all resources in parallel with rate limiting
-  const BATCH_SIZE = 10;
+  const BATCH_SIZE = 5;
   const allUrls = Array.from(urlsToCache);
   
   for (let i = 0; i < allUrls.length; i += BATCH_SIZE) {
@@ -137,6 +254,7 @@ function updateNetworkStatus() {
 self.addEventListener('install', event => {
   logger.log('Installing service worker');
   event.waitUntil((async () => {
+    await openIndexedDB(); // Initialize IndexedDB
     await cacheResources();
     self.skipWaiting();
     logger.log('Installation complete');
@@ -146,15 +264,6 @@ self.addEventListener('install', event => {
 self.addEventListener('activate', event => {
   logger.log('Activating service worker');
   event.waitUntil((async () => {
-    const keys = await caches.keys();
-    await Promise.all(
-      keys.map(key => {
-        if (key !== CACHE_NAME) {
-          logger.debug(`Deleting old cache: ${key}`);
-          return caches.delete(key);
-        }
-      })
-    );
     self.clients.claim();
     updateNetworkStatus();
     logger.log('Activation complete');
@@ -178,22 +287,9 @@ self.addEventListener('fetch', event => {
       try {
         const networkResponse = await fetch(request);
         
-        // Cache the response
-        const cache = await caches.open(CACHE_NAME);
-        await cache.put(request, networkResponse.clone());
+        // Update IndexedDB for persistence
+        await updateIndexedDB(url, networkResponse.clone());
         logger.debug(`Updated cache from network: ${url}`);
-        
-        // Update localStorage for text resources
-        const contentType = networkResponse.headers.get('Content-Type') || '';
-        if (contentType.match(/^(text|application\/json)/)) {
-          const text = await networkResponse.text();
-          try {
-            localStorage.setItem(url, text);
-            logger.debug(`Updated localStorage from network: ${url}`);
-          } catch (e) {
-            logger.warn(`localStorage update failed for ${url}`);
-          }
-        }
         
         return networkResponse;
       } catch (e) {
@@ -202,21 +298,19 @@ self.addEventListener('fetch', event => {
       }
     }
     
-    // Offline fallback
+    // Offline fallback - try IndexedDB
     try {
-      // Try cache first
-      const cachedResponse = await caches.match(request);
-      if (cachedResponse) {
-        logger.debug(`Serving from cache: ${url}`);
-        return cachedResponse;
-      }
+      const db = await openIndexedDB();
+      const tx = db.transaction(['resources'], 'readonly');
+      const store = tx.objectStore('resources');
+      const stored = await store.get(url);
       
-      // Then try localStorage for text resources
-      const cachedText = localStorage.getItem(url);
-      if (cachedText) {
-        logger.debug(`Serving from localStorage: ${url}`);
-        return new Response(cachedText, {
-          headers: { 'Content-Type': 'text/html' }
+      if (stored) {
+        logger.debug(`Serving from IndexedDB: ${url}`);
+        return new Response(stored.data, {
+          headers: new Headers({
+            'Content-Type': stored.headers.contentType || 'text/plain'
+          })
         });
       }
       
@@ -252,6 +346,57 @@ self.addEventListener('offline', () => {
   updateNetworkStatus();
 });
 
+// Handle messages from clients
+self.addEventListener('message', event => {
+  const data = event.data;
+  
+  if (data.type === 'SET_ONLINE_STATUS') {
+    isOnline = data.online;
+    logger.log(`Manual online status change: ${isOnline ? 'online' : 'offline'}`);
+  } else if (data.type === 'UPDATE_RESOURCES') {
+    logger.log('Manual cache update requested');
+    cacheResources();
+  } else if (data.type === 'CLEAR_CACHE') {
+    logger.log('Clearing cache requested');
+    clearCache();
+  } else if (data.type === 'GET_CACHED_RESOURCES') {
+    getCachedResources().then(resources => {
+      event.ports[0].postMessage({
+        type: 'CACHED_RESOURCES',
+        resources: resources
+      });
+    });
+  } else if (data.type === 'GET_STORAGE_USAGE') {
+    getStorageUsage().then(usage => {
+      event.ports[0].postMessage({
+        type: 'STORAGE_USAGE',
+        usage: usage
+      });
+    });
+  } else if (data.type === 'CACHE_PAGE') {
+    logger.log(`Caching page: ${data.url}`);
+    urlsToCache.add(data.url);
+    cacheResources();
+  }
+});
+
+async function clearCache() {
+  try {
+    // Clear IndexedDB
+    const db = await openIndexedDB();
+    const tx = db.transaction(['resources'], 'readwrite');
+    const store = tx.objectStore('resources');
+    await store.clear();
+    
+    // Clear in-memory Set
+    urlsToCache.clear();
+    
+    logger.log('Cache cleared successfully');
+  } catch (e) {
+    logger.error('Error clearing cache:', e);
+  }
+}
+
 // Continuous updates when online
 function startUpdateInterval() {
   setInterval(() => {
@@ -263,15 +408,6 @@ function startUpdateInterval() {
 }
 
 // Initialize
-self.addEventListener('message', event => {
-  if (event.data === 'init') {
-    logger.log('Initialization requested');
-    updateNetworkStatus();
-    startUpdateInterval();
-  }
-});
-
-// Start the service worker
 logger.log('Service worker starting');
 updateNetworkStatus();
 startUpdateInterval();
